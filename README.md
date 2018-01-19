@@ -39,4 +39,4 @@
   * `gedit setup.py`
   * edit this line to be _d['packages'] = ['promp', 'promp.ros']_ and save and close the file
   * `sudo python setup.py install`
-  * `cd ~/ros_ws` | `catkin_make` | `catkin_make install`
+  * `cd ~/ros_ws | catkin_make | catkin_make install`
