@@ -1,5 +1,9 @@
 # ProMP
 
+## Description
+
+Probabilistic Movement Primitives implementation for learning motion of basic tasks in robotics, based on the research of [Alexandros Paraschos, Christian Daniel, Jan Peters, and Gerhard Neumann at TU Darmstadt, Germany.](http://www.ias.tu-darmstadt.de/uploads/Publications/Paraschos_NIPS_2013a.pdf) 
+
 ## Installation
 
 1. Install the Baxter workspace
