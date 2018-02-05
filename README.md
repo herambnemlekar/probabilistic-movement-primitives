@@ -46,8 +46,8 @@ Probabilistic Movement Primitives implementation for learning motion of basic ta
   * `cd ~/ros_ws | catkin_make | catkin_make install`
 
 3. _OSError: [Errno 110] Right limb init failed to get current joint_states from robot/joint_states_
-  * 
+  * Run the code on Baxter's computer to allow access of joint angles publisher thread
   
 4. If code is stuck at: *rospy.wait_for_service(self._kinematics_names['ik'][self._selected_ik])* or gives error: _rospy.exceptions.ROSInterruptException: rospy shutdown_
-  * 
+  * Comment line - of file.py
 
