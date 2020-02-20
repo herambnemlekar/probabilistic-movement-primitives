@@ -1,246 +1,76 @@
 #!/usr/bin/env python
-import pdb
-import rospy
 import sys, time, os
 import numpy as np
 from scipy import linalg
-from handover.msg import skeleton
-from std_msgs.msg import Float64MultiArray
-from geometry_msgs.msg import PointStamped
-from geometry_msgs.msg import PoseArray
-from reflex_msgs.msg import Command
-import baxter_interface
-from scipy.optimize import minimize
-from scipy.spatial.distance import mahalanobis
+
 
 class ProMP:
-    
-    def __init__(self):
-        self.goal_pub = rospy.Publisher("/promp_data", Float64MultiArray, queue_size=10)
-        self.grasp_pub = rospy.Publisher("/right_hand/command", Command, queue_size=10)
 
-        self.ndemos = 18
-        self.obs_dofs = 9
-        self.bax_dofs = 7
+    def __init__(self, ndemos, obs_dofs, robot_dofs, training_address):
+
+        self.ndemos = ndemos
+        self.obs_dofs = obs_dofs
+        self.robot_dofs = robot_dofs
+
         self.stdev = 0.005
-
         self.dt = 0.01
-        self.p_data, self.q_data = self.loadData(self.dt)
 
+        self.count = 0
+        self.start = 1
+
+        self.p_data, self.q_data = self.loadData(self.dt, training_address)
         self.promp = self.pmpRegression(self.q_data)
 
-        self.param = {"nTraj":self.p_data["size"], "nTotalJoints":self.promp["nJoints"], "observedJointPos":np.array([0,1,2]), "observedJointVel":np.array([])}
+        self.param = {"nTraj": self.p_data["size"], "nTotalJoints": self.promp["nJoints"], "observedJointPos": np.array(range(obs_dofs)), "observedJointVel": np.array([])}
 
-        self.obs_sub = rospy.Subscriber("/objects/3d", PoseArray, self.callback, queue_size=10)
+        print "Initialized"
 
-        self.limb = baxter_interface.Limb('right')
-
-        init_angles = {'right_s0': -1.6889128474618404, 'right_s1': 0.6412039693361029, 'right_w0': -0.1392087565006013, 'right_w1': 0.006519418348513008, 'right_w2': -3.0464858447404315, 'right_e0': 0.5829126993964572, 'right_e1': 1.0737865515197895}
-        self.limb.move_to_joint_positions(init_angles,timeout=3.0)
-
-        text = raw_input("Run obstacle avoidance? (Y/n)")
-        if text  == 'n':
-            print "Ok. Not moving."
-        else:
-            self.obstacleAvoidance()
-
-        text = raw_input("Run ProMP? (Y/n)")
-        if text  == 'n':
-            print "Ok. Not moving."
-        else:
-            self.runPromp()
-
-    def callback(self,data):
-        pos = data.poses
-        point = np.array([pos[0].position.x,pos[0].position.y,pos[0].position.z])#,pos[1].position.x,pos[1].position.y,pos[1].position.z,pos[2].position.x,pos[2].position.y,pos[2].position.z])
-        obs = self.Observation(self.stdev,self.param,self.p_data,point)
-        self.kf = self.kfLoop(self.promp,self.param,obs)
-
-    def obstacleAvoidance(self):
-        t_o = 70
-        nJoints = self.promp["w"]["nJoints"]
-        w0, b = [], []
-        for i in range(nJoints):
-            w0.append(self.kf["w_mean"][i])
-            b.append(self.kf["q_sigma_ii"][i][t_o])
-        self.w0 = np.matrix(np.array(w0)).T
-        self.b_std = np.matrix(np.array(b))
-        self.base = self.promp["basis"]["Gn"][t_o]
-
-        bnd = (-30,30)
-        Bnd = (bnd,)*300
-        con1 = {'type': 'eq', 'fun': self.constraint1}
-        con2 = {'type': 'ineq', 'fun': self.constraint2}
-        cons = [con1,con2]
-
-        sol = minimize(self.objective, w0, method='SLSQP', bounds=Bnd, constraints=cons)
-
-        w = sol["x"]
-        w = np.matrix([w[:30],w[30:60],w[60:90],w[90:120],w[120:150],w[150:180],w[180:210],w[210:240],w[240:270],w[270:300]])
-        y_new = w*self.promp["basis"]["Gn"].T
-
-        # for i in range(nJoints):
-        #     self.kf["q_mean"][i] = y_new[i]
-
-        traj_plot = np.empty((0,7),dtype=float)
-        for j in range(y_new.shape[1]):
-            promp = []
-            for i in range(y_new.shape[0]):
-                    promp.append(y_new[i,j])
-            promp = np.array(promp[3:10])
-            print promp.shape
-            print np.matrix(promp).shape
-
-            traj_plot = np.append(traj_plot,np.matrix(promp),axis=0)
-
-        np.savetxt("src/handover/scripts/traj1.csv", traj_plot, delimiter=",")
-
-    def objective(self,w):
-        w = np.matrix([w[:30],w[30:60],w[60:90],w[90:120],w[120:150],w[150:180],w[180:210],w[210:240],w[240:270],w[270:300]]).T
-        # o = np.matmul((w-w_mean).T,(w-w_mean))
-        o = np.linalg.norm(w - self.w0)**2
-        return o
-
-    def constraint1(self,w):
-        y_o = np.array([0.6,-0.5,0.2])
-        D = np.array([0.15,0.15,0.15])
-        w = np.matrix([w[:30],w[30:60],w[60:90],w[90:120],w[120:150],w[150:180],w[180:210],w[210:240],w[240:270],w[270:300]])
-        # c1 = ((y - basis.T*w).T * M * (y - basis.T*w)) - D**2
-        y_w = w*self.base.T
-        c1 = np.linalg.norm(y_o[0:3] - y_w[0:3] - D)**2
-        return c1
-
-    def constraint2(self,w):
-        w = np.matrix([w[:30],w[30:60],w[60:90],w[90:120],w[120:150],w[150:180],w[180:210],w[210:240],w[240:270],w[270:300]])
-        x = w*self.base.T
-        y = self.base*self.w0
-        z = np.linalg.inv(np.cov(self.w0.T))
-        mb = mahalanobis(x,y,z)
-        c2 = np.linalg.norm(self.b_std - mb)**2
-        return c2
-
-    def runPromp(self):
-        grip = Command()
-        grip.pose.f1 = 0.0
-        grip.pose.f2 = 0.0
-        grip.pose.f3 = 0.0
-        grip.pose.preshape = 0.0
-        grip.velocity.f1 = 2.0
-        grip.velocity.f2 = 2.0
-        grip.velocity.f3 = 2.0
-        grip.velocity.preshape = 2.0
-        self.grasp_pub.publish(grip)
+    def predictTraining(self, demo=0):
+        '''
         
-        r = rospy.Rate(7)
-        traj_plot = np.empty((0,7),dtype=float)
-        for j in range(len(self.kf["q_mean"][3])):
-            promp = []
-            for i in range(len(self.kf["q_mean"])):
-                    promp.append(self.kf["q_mean"][i][j])
-            promp = np.array(promp[3:10])
+        '''
+        self.phase = 99
+        obs = self.q_data[demo][self.phase, :self.obs_dofs]
+        print obs
+        return self.predictTest(obs)
 
-            traj_plot = np.append(traj_plot,np.matrix(promp),axis=0)
+    def predictTest(self, obs, phase=99):
+        """
+        ProMP Estimation
+        :param obs:
+        :param phase:
+        :return:
+        """
 
-            P = Float64MultiArray()
-            P.data = np.array(promp)
-            self.goal_pub.publish(P)
-            r.sleep()
+        self.obs_pose = obs
+        self.phase = phase
+        obs = self.Observation(self.stdev, self.param, self.p_data, self.obs_pose)
+        self.kf = self.kfLoop(self.promp, self.param, obs)
 
-        np.savetxt("src/handover/scripts/traj2.csv", traj_plot, delimiter=",")
+        return self.kf["q_mean"]
 
-        t = time.time()
-        tt = 0
-        r2 = rospy.Rate(7)
-        while tt < 1:
-            self.goal_pub.publish(P)
-            tt = time.time() - t
-            r2.sleep()
-
-
-        text = raw_input("Grab bottle? (Y/n)")
-        if text  == 'n':
-            print "Ok. Going back."
-        else:
-            grip.pose.f1 = 2.0
-            grip.pose.f2 = 2.0
-            grip.pose.f3 = 2.0
-            grip.pose.preshape = 0.0
-            grip.velocity.f1 = 2.0
-            grip.velocity.f2 = 2.0
-            grip.velocity.f3 = 2.0
-            grip.velocity.preshape = 2.0
-
-            self.grasp_pub.publish(grip)
-            time.sleep(2.0)
-
-            text = raw_input("Give to human? (Y/n)")
-            if text  == 'n':
-                print "Ok. Going back."
-            else:
-                otp = {'right_s0': 0.6507913492603867, 'right_s1': -0.19941750242510378, 'right_w0': 1.992257548266181, 'right_w1': 0.043334957257762936, 'right_w2': -3.008136325043296, 'right_e0': 1.0496263541105944, 'right_e1': 0.4855049193657335}
-                self.limb.move_to_joint_positions(otp,timeout=2.0)
-
-                grip.pose.f1 = 0.0
-                grip.pose.f2 = 0.0
-                grip.pose.f3 = 0.0
-                grip.pose.preshape = 0.0
-                grip.velocity.f1 = 2.0
-                grip.velocity.f2 = 2.0
-                grip.velocity.f3 = 2.0
-                grip.velocity.preshape = 2.0
-
-                self.grasp_pub.publish(grip)
-                time.sleep(2.0)
-
-        goback = {'right_s0': -0.1902136176977913, 'right_s1': -0.24236896448589537, 'right_w0': 1.6171992456281974, 'right_w1': 0.4966262800779027, 'right_w2': -2.9931800123614134, 'right_e0': 0.9583544972314122, 'right_e1': 1.2133788032173622}
-        self.limb.move_to_joint_positions(goback,timeout=2.0)
-
-        # promp = []
-        # for i in range(len(self.kf["q_mean"])):
-        #         promp.append(self.kf["q_mean"][i][98])
-        # promp = np.array(promp[3:10])
-
-        # P = Float64MultiArray()
-        # P.data = promp
-            
-        # self.goal_pub.publish(P)
-
-        text = raw_input("Restart motion? (Y/n)")
-        if text  == 'n':
-            print "Ok. Not moving."
-        else:
-            init_angles = {'right_s0': -1.6889128474618404, 'right_s1': 0.6412039693361029, 'right_w0': -0.1392087565006013, 'right_w1': 0.006519418348513008, 'right_w2': -3.0464858447404315, 'right_e0': 0.5829126993964572, 'right_e1': 1.0737865515197895}
-            self.limb.move_to_joint_positions(init_angles,timeout=2.0)
-
-        text = raw_input("Run ProMP again? (Y/n)")
-        if text  == 'n':
-            print "Ok. Not moving."
-        else:
-            self.runPromp()
-
-
-    def loadData(self,dt):
-        bax_data, obs_data = [], []
+    def loadData(self, dt, training_address):
+        robot_data, obs_data = [], []
         for i in range(self.ndemos):
-            bax = np.loadtxt(open("src/handover/promp/Data/demo_pos_"+ str(i+1) +".csv", "rb"), delimiter=",")
-            bax_data.append(bax)
-            obs = np.loadtxt(open("src/handover/promp/Data/demo_human_"+ str(i+1) +".csv", "rb"), delimiter=",")
-            obs_data.append(obs[:,:3])
+            robot = np.loadtxt(open(training_address + "/robot_demo_"+ str(i+1) +".csv", "rb"), delimiter=",")
+            robot_data.append(robot)
+            obs = np.loadtxt(open(training_address + "/object_demo_"+ str(i+1) +".csv", "rb"), delimiter=",")
+            obs_data.append(obs)
 
-        bax, bax_mean = self.addVelocity(bax_data)
+        robot, robot_mean = self.addVelocity(robot_data)
         obs, obs_mean = self.addVelocity(obs_data)
 
         demo_data = []
-        for i in range(len(bax)):
-            demo_data.append(np.concatenate((obs[i],bax[i]),axis=1))
-        demo_mean = np.concatenate((obs_mean,bax_mean),axis=1)
+        for i in range(len(robot)):
+            demo_data.append(np.concatenate((obs[i], robot[i]),axis=1))
+        demo_mean = np.concatenate((obs_mean,robot_mean), axis=1)
 
         demo = {"q":[], "qdot":[], "q_mean":[], "q_cov":[], "q_var":[], "qdot_mean":[], "qdot_cov":[], "qdot_var":[]}
         for i in range(demo_data[0].shape[1]/2):
             q = q_dot = []
             for j in range(len(demo_data)):
                 q.append(demo_data[j][:,2*i].T)
-                q_dot.append(demo_data[j][:,(2*i)+1].T)    #TODO: Velocity not recalculated like in MATLAB. VERIFY!!???                                       
+                q_dot.append(demo_data[j][:,(2*i)+1].T)    #TODO: Velocity not recalculated like in MATLAB. VERIFY!!???
             demo["q"].append(np.matrix(q))
             demo["qdot"].append(np.matrix(q_dot))
 
@@ -254,9 +84,6 @@ class ProMP:
 
         demo["size"] = demo_data[0].shape[0]
 
-        # print demo["qdot_mean"][4]
-        # print demo["q"][0].shape, demo["qdot"][0].shape, demo["q_mean"][0].shape, demo["q_cov"][0].shape, demo["q_var"][0].shape, demo["qdot_mean"][0].shape, demo["qdot_cov"][0].shape, demo["qdot_var"][0].shape
-
         demo_q = []
         for i in range(len(demo_data)):
             q = []
@@ -264,9 +91,11 @@ class ProMP:
                 q.append(demo_data[i][:,2*j])
             demo_q.append(np.matrix(q).T)
 
+        print "Data Loaded"
+
         return demo, demo_q
 
-    def addVelocity(self,data):
+    def addVelocity(self, data):
         for k in range(len(data)):
             d = data[k]
 
@@ -286,7 +115,7 @@ class ProMP:
 
         return data, mean
 
-    def pmpRegression(self,data,nBasis=30):
+    def pmpRegression(self, data, nBasis=30):
         nJoints = data[0].shape[1]
         nDemo = len(data)
         nTraj = data[0].shape[0]
@@ -295,7 +124,7 @@ class ProMP:
         phase = self.Phase(self.dt)
 
         weight = {"nBasis":nBasis, "nJoints":nJoints, "nTraj":nTraj, "nDemo":nDemo}
-        weight["my_linRegRidgeFactor"] = 1e-08 * np.identity(nBasis)        
+        weight["my_linRegRidgeFactor"] = 1e-08 * np.identity(nBasis)
 
         sigma = 0.05 * np.ones((1, nBasis))
 
@@ -309,7 +138,7 @@ class ProMP:
 
     def Phase(self,t):
         phase = {"dt":t}
-        phase["z"] = np.linspace(t,1,1/t)
+        phase["z"] = np.linspace(t, 1, 1/t)
         zd = np.diff(phase["z"])/t
         phase["zd"] = np.append(zd,zd[-1])
         zdd = np.diff(phase["zd"])/t
@@ -335,14 +164,14 @@ class ProMP:
         Basis = {}
 
         basis = np.multiply(np.exp(-0.5*np.power(at,2)), 1./sigma/np.sqrt(2*np.pi))
-        basis_sum = np.sum(basis, axis = 1)
+        basis_sum = np.sum(basis, axis=1)
         basis_n = np.multiply(basis, 1.0/basis_sum)
 
         z_minus_center_sigma = np.multiply(-z_minus_center, 1.0/np.power(sigma,2))
         basisD = np.multiply(z_minus_center_sigma, basis)
 
         # normalizing basisD
-        basisD_sum = np.sum(basisD, axis = 1)
+        basisD_sum = np.sum(basisD, axis=1)
         basisD_n_a = np.multiply(basisD, basis_sum)
         basisD_n_b = np.multiply(basis, basisD_sum)
         basisD_n = np.multiply(basisD_n_a - basisD_n_b, 1.0/np.power(basis_sum,2))
@@ -350,7 +179,7 @@ class ProMP:
         # second derivative of the basis
         tmp = np.multiply(basis, -1.0/np.power(sigma,2))
         basisDD = tmp + np.multiply(z_minus_center_sigma, basisD)
-        basisDD_sum = np.sum(basisDD, axis = 1)
+        basisDD_sum = np.sum(basisDD, axis=1)
 
         # normalizing basisDD
         basisDD_n_a = np.multiply(basisDD, np.power(basis_sum,2))
@@ -383,62 +212,75 @@ class ProMP:
         for i in range(nJoints):
             w_j = np.empty((0,nBasis), float)
             for j in range(nDemo):
-                w_ = MPPI*data[j][:,i]
-                w_j = np.append(w_j,w_.T,axis=0)
+                w_ = MPPI*data[j][:, i]
+                w_j = np.append(w_j, w_.T, axis=0)
             w.append(w_j)
-            ind.append(np.matrix(range(i*nBasis,(i+1)*nBasis)))
+            ind.append(np.matrix(range(i*nBasis, (i+1)*nBasis)))
 
         weight["index"] = ind
         weight["w_full"] = np.empty((nDemo,0), float)
         for i in range(nJoints):
-            weight["w_full"] = np.append(weight["w_full"],w[i],axis=1)
+            weight["w_full"] = np.append(weight["w_full"], w[i], axis=1)
 
         weight["cov_full"] = np.cov(weight["w_full"].T)
-        weight["mean_full"] = np.mean(weight["w_full"],axis=0).T
+        weight["mean_full"] = np.mean(weight["w_full"], axis=0).T
 
         return weight
 
-    def Observation(self,stdev,param,p_data,obs_data,observed_data_index=[99]):
-        obs = {"joint":param["observedJointPos"], "jointvel":param["observedJointVel"], "stdev":stdev}
-        obs["q"] = np.zeros((param["nTotalJoints"],param["nTraj"]))
-        obs["qdot"] = np.zeros((param["nTotalJoints"],param["nTraj"]))
-        obs["index"] = observed_data_index
+    def Observation(self, stdev, param, p_data, obs_data):
+        obs = {"joint": param["observedJointPos"], "jointvel": param["observedJointVel"], "stdev": stdev}
+        obs["q"] = np.zeros((param["nTotalJoints"], param["nTraj"]))
+        obs["qdot"] = np.zeros((param["nTotalJoints"], param["nTraj"]))
+        obs["index"] = [99]
+
         for i in obs["joint"]:
-            obs["q"][i,obs["index"]] = obs_data[i]
+            obs["q"][i, obs["index"]] = obs_data[0, i]
 
         return obs
 
-    def kfLoop(self,promp,param,obs):
+    def kfLoop(self, promp, param, obs):
         sigma_obs = obs["stdev"]
         P0 = promp["w"]["cov_full"]
         x0 = promp["w"]["mean_full"]
         R_obs = (sigma_obs**2)*np.identity(2*param["nTotalJoints"])
 
         for k in obs["index"]:
-            H0 = self.observationMatrix(k,promp,obs["joint"],obs["jointvel"])
+            H0 = self.observationMatrix(k, promp, obs["joint"], obs["jointvel"])
 
-
-            z0 = np.empty((0,0), float)
+            z0 = np.empty((0, 0), float)
             for i in range(promp["nJoints"]):
-                z0 = np.append(z0, obs["q"][i,k])
-                z0 = np.append(z0, obs["qdot"][i,k])
+                z0 = np.append(z0, obs["q"][i, k])
+                z0 = np.append(z0, obs["qdot"][i, k])
             z0 = np.matrix(z0).T
 
-            x0, P0 = self.kfRecursion(x0,P0,H0,z0,R_obs)
+            x0, P0 = self.kfRecursion(x0, P0, H0, z0, R_obs)
 
-            jointKF = self.perJointPromp(x0,P0,promp)
+            jointKF = self.perJointPromp(x0, P0, promp)
 
         return jointKF
 
-    def observationMatrix(self,k,p,observedJointPos,observedJointVel):
+
+
+    def kfRecursion(self, x_old, P_old, H, z, R_obs):
+        H, P_old = np.matrix(H), np.matrix(P_old)
+        tmp = np.matmul(H,np.matmul(P_old, H.T)) + R_obs
+        K = np.matmul(np.matmul(P_old, H.T), np.linalg.inv(tmp))
+
+        P_new = P_old - (K*H*P_old)
+
+        x_new = x_old + K*(z - (H*x_old))
+
+        return x_new, P_new
+
+    def observationMatrix(self, k, p, observedJointPos, observedJointVel):
         nJoints = p["nJoints"]
         nTraj = p["nTraj"]
         Gn = p["basis"]["Gn"]
         Gn_d = p["basis"]["Gndot"]
         normalizedTime = k
 
-        Hq_measured = Gn[normalizedTime,:]
-        Hqdot_measured = Gn_d[normalizedTime,:]
+        Hq_measured = Gn[normalizedTime, :]
+        Hqdot_measured = Gn_d[normalizedTime, :]
         Hq_unmeasured = np.zeros((1, p["nBasis"]))
         Hqdot_unmeasured = np.zeros((1, p["nBasis"]))
 
@@ -447,11 +289,11 @@ class ProMP:
             if not observedJointPos.all:
                 H_temp = Hq_unmeasured
             else:
-                if np.sum(i==observedJointPos)==0:
+                if np.sum(i == observedJointPos) == 0:
                     H_temp = Hq_unmeasured
                 else:
                     H_temp = Hq_measured
-            
+
             if not observedJointVel: #when joint vel not observed
                 H_temp = np.append(H_temp, Hqdot_unmeasured, axis = 0)
             else:
@@ -465,21 +307,11 @@ class ProMP:
 
         return H
 
-    def kfRecursion(self,x_old,P_old,H,z,R_obs):
-        H, P_old = np.matrix(H), np.matrix(P_old)
-        tmp = np.matmul(H,np.matmul(P_old,H.T)) + R_obs
-        K = np.matmul(np.matmul(P_old,H.T),np.linalg.inv(tmp))
-
-        P_new = P_old - (K*H*P_old)
-        x_new = x_old + K*(z - (H*x_old))
-
-        return x_new, P_new
-
-    def perJointPromp(self,xFull,Pfull,pmp):
+    def perJointPromp(self, xFull, Pfull,pmp):
         nBasis = pmp["nBasis"]
         nTraj = pmp["nTraj"]
 
-        kf = {"w_mean":[],"w_sigma":[],"w_sigma_ii":[],"q_mean":[],"q_sigma_ii":[],"qdot_mean":[],"qdot_sigma_ii":[]}
+        kf = {"w_mean": [], "w_sigma": [], "w_sigma_ii": [], "q_mean": [], "q_sigma_ii": [], "qdot_mean": [], "qdot_sigma_ii": []}
         for i in range(pmp["nJoints"]):
             ind = np.array(range(i*nBasis,(i+1)*nBasis))
             kf["w_mean"].append(xFull[ind])
@@ -495,7 +327,7 @@ class ProMP:
 
         return kf
 
-    def thetaToTraj(self,w_mean,P_w,basis,phase_dt,nTraj):
+    def thetaToTraj(self, w_mean, P_w, basis, phase_dt, nTraj):
         x_mean = []
         x_sigma_ii = []
         xdot_mean = []
@@ -511,7 +343,7 @@ class ProMP:
 
         return x_mean, x_sigma_ii, xdot_mean, xdot_sigma_ii
 
-    def getDistribtionsAtTimeT1(self,w_mu,w_cov,basis,dt,timePoint):
+    def getDistribtionsAtTimeT1(self, w_mu, w_cov, basis, dt, timePoint):
         timePointIndex = int(round(timePoint/dt))
 
         Psi_t = basis["Gn"][timePointIndex,:]
@@ -536,14 +368,7 @@ class ProMP:
         return mu_x, mu_xd, sigma_t #, sigma_t1, sigma_t_t1, sigma_td_half
 
 def main(args):
-    rospy.init_node('ProMP', anonymous=True)
-    pmp = ProMP()   
-    
-    try:
-        rospy.spin()
-    except KeyboardInterrupt:
-        print ("Shutting down")
-
+    pmp = ProMP()
 
 if __name__ == '__main__':
     main(sys.argv)
